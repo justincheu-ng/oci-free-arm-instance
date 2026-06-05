@@ -2,27 +2,11 @@ name: Try to Create OCI VM
 
 on:
   schedule:
-    - cron: "8,23,38,53 * * * *"
+    - cron: "*/10 * * * *"
   workflow_dispatch:
-    inputs:
-      retry_delay_seconds:
-        description: "Seconds to wait before dispatching the next retry"
-        required: false
-        default: "900"
-
-permissions:
-  actions: write
-  contents: read
-
-concurrency:
-  group: oci-free-arm-instance
-  cancel-in-progress: false
 
 env:
-  SUPPRESS_LABEL_WARNING: true
-  RETRY_DELAY_SECONDS: ${{ github.event.inputs.retry_delay_seconds || '900' }}
-  GITHUB_TOKEN: ${{ github.token }}
-
+  FORCE_JAVASCRIPT_ACTIONS_TO_NODE24: true
   COMPARTMENT_ID: ${{ secrets.OCI_COMPARTMENT_ID }}
   IMAGE_ID: ${{ secrets.IMAGE_ID }}
   SUBNET_ID: ${{ secrets.OCI_SUBNET_ID }}
@@ -32,12 +16,10 @@ env:
   OCI_CLI_TENANCY: ${{ secrets.OCI_CLI_TENANCY }}
   OCI_CLI_FINGERPRINT: ${{ secrets.OCI_CLI_FINGERPRINT }}
   OCI_CLI_KEY_CONTENT: ${{ secrets.OCI_CLI_KEY_CONTENT }}
-  FORCE_JAVASCRIPT_ACTIONS_TO_NODE24: true
 
 jobs:
-  build-and-deploy:
+  create-vm:
     runs-on: ubuntu-latest
-
     steps:
       - name: Cache pip packages
         uses: actions/cache@v4
@@ -46,123 +28,30 @@ jobs:
           key: ${{ runner.os }}-pip-oci-cli-v1
 
       - name: Add OCI CLI to path
-        run: echo "$HOME/.local/bin" >> "$GITHUB_PATH"
+        run: echo "$HOME/.local/bin" >> $GITHUB_PATH
 
       - name: Setup OCI CLI and try to create VM
+        id: create_vm
+        continue-on-error: true
         run: |
           set -o pipefail
 
-          pip install --user oci-cli
+          pip install oci-cli
 
-          mkdir -p /home/runner/.oci
+          mkdir -p ~/.oci
+          echo "${{ secrets.OCI_CLI_KEY_CONTENT }}" > ~/.oci/oci_api_key.pem
+          chmod 600 ~/.oci/oci_api_key.pem
 
-          printf '%s\n' "${{ secrets.OCI_CLI_KEY_CONTENT }}" > /home/runner/.oci/oci_api_key.pem
-          chmod 600 /home/runner/.oci/oci_api_key.pem
-
-          echo "[DEFAULT]" > /home/runner/.oci/config
-          echo "user=${{ secrets.OCI_CLI_USER }}" >> /home/runner/.oci/config
-          echo "tenancy=${{ secrets.OCI_CLI_TENANCY }}" >> /home/runner/.oci/config
-          echo "fingerprint=${{ secrets.OCI_CLI_FINGERPRINT }}" >> /home/runner/.oci/config
-          echo "key_file=/home/runner/.oci/oci_api_key.pem" >> /home/runner/.oci/config
-          echo "region=${{ env.OCI_CLI_REGION }}" >> /home/runner/.oci/config
-          chmod 600 /home/runner/.oci/config
-
-          dispatch_next_run() {
-            echo "Capacity unavailable. Waiting ${RETRY_DELAY_SECONDS}s before dispatching the next retry."
-            sleep "$RETRY_DELAY_SECONDS"
-            printf '{"ref":"%s"}' "${GITHUB_REF_NAME:-main}" > /home/runner/dispatch.json
-            curl -fsSL \
-              -X POST \
-              -H "Accept: application/vnd.github+json" \
-              -H "Authorization: Bearer $GITHUB_TOKEN" \
-              -H "X-GitHub-Api-Version: 2022-11-28" \
-              "https://api.github.com/repos/${GITHUB_REPOSITORY}/actions/workflows/main.yml/dispatches" \
-              --data @/home/runner/dispatch.json
-            echo "Next retry has been dispatched."
-          }
-
-          case "$COMPARTMENT_ID" in
-            ocid1.tenancy.*|ocid1.compartment.*) ;;
-            *) echo "OCI_COMPARTMENT_ID is not a raw compartment/tenancy OCID."; exit 1 ;;
-          esac
-          case "$SUBNET_ID" in
-            ocid1.subnet.*) ;;
-            *) echo "OCI_SUBNET_ID is not a raw subnet OCID."; exit 1 ;;
-          esac
-          case "${IMAGE_ID:-}" in
-            ""|ocid1.image.*) ;;
-            *) echo "IMAGE_ID is not a raw image OCID."; exit 1 ;;
-          esac
-          case "$AD_NAME" in
-            *:AP-SINGAPORE-1-AD-1) ;;
-            *) echo "AD_NAME does not look like the Singapore AD name."; exit 1 ;;
-          esac
-
-          printf '%s\n' "${{ secrets.SSH_PUBLIC_KEY }}" | tr -d '\r' | awk '/^ssh-rsa / { print; exit }' > /home/runner/my_ssh_key.pub
-          if ! grep -Eq '^ssh-rsa [A-Za-z0-9+/=]+( .*)?$' /home/runner/my_ssh_key.pub; then
-            echo "SSH_PUBLIC_KEY must be a single ssh-rsa public key line."
-            exit 1
-          fi
-
-          oci iam region list >/dev/null
-          echo "Accessible subnets in compartment:"
-          oci network subnet list --compartment-id "$COMPARTMENT_ID" --all --query 'data[*].{"name":"display-name","id":"id","domain":"availability-domain","public":"prohibit-public-ip-on-vnic"}' --output table || true
-          oci network subnet get --subnet-id "$SUBNET_ID" >/dev/null
-
-          EXISTING_INSTANCE=$(oci compute instance list \
-            --compartment-id "$COMPARTMENT_ID" \
-            --display-name "oracle-a1-singapore" \
-            --lifecycle-state RUNNING \
-            --query 'data[0].id' \
-            --raw-output)
-          if [ -z "$EXISTING_INSTANCE" ] || [ "$EXISTING_INSTANCE" = "null" ]; then
-            EXISTING_INSTANCE=$(oci compute instance list \
-              --compartment-id "$COMPARTMENT_ID" \
-              --display-name "oracle-a1-singapore" \
-              --lifecycle-state PROVISIONING \
-              --query 'data[0].id' \
-              --raw-output)
-          fi
-          if [ -n "$EXISTING_INSTANCE" ] && [ "$EXISTING_INSTANCE" != "null" ]; then
-            echo "SUCCESS: Existing instance found: $EXISTING_INSTANCE. Disable this workflow after confirming the instance."
-            exit 0
-          fi
-
-          if [ -n "${IMAGE_ID:-}" ]; then
-            if ! oci compute image get --image-id "$IMAGE_ID" >/dev/null 2>&1; then
-              echo "Configured IMAGE_ID is not accessible; selecting the latest Canonical Ubuntu 22.04 image instead."
-              IMAGE_ID=""
-            fi
-          fi
-
-          if [ -z "${IMAGE_ID:-}" ]; then
-            IMAGE_ID=$(oci compute image list \
-              --compartment-id "$COMPARTMENT_ID" \
-              --operating-system "Canonical Ubuntu" \
-              --operating-system-version "22.04" \
-              --shape "VM.Standard.A1.Flex" \
-              --sort-by TIMECREATED \
-              --sort-order DESC \
-              --query 'data[0].id' \
-              --raw-output)
-          fi
-
-          if [ -z "$IMAGE_ID" ] || [ "$IMAGE_ID" = "null" ]; then
-            echo "No compatible Canonical Ubuntu 22.04 image was found for VM.Standard.A1.Flex."
-            exit 1
-          fi
-
-          oci compute image get --image-id "$IMAGE_ID" >/dev/null
-          echo "Using image:"
-          oci compute image get --image-id "$IMAGE_ID" --query 'data.{"name":"display-name","id":"id"}' --output table
-
-          cat > /home/runner/source-details.json <<EOF
-          {
-            "sourceType": "image",
-            "imageId": "$IMAGE_ID",
-            "bootVolumeSizeInGBs": 50
-          }
+          cat > ~/.oci/config <<EOF
+          [DEFAULT]
+          user=${{ secrets.OCI_CLI_USER }}
+          tenancy=${{ secrets.OCI_CLI_TENANCY }}
+          fingerprint=${{ secrets.OCI_CLI_FINGERPRINT }}
+          key_file=~/.oci/oci_api_key.pem
+          region=${{ secrets.OCI_CLI_REGION }}
           EOF
+
+          echo "${{ secrets.SSH_PUBLIC_KEY }}" > /home/runner/my_ssh_key.pub
 
           OCI_OUTPUT=$(oci compute instance launch \
             --compartment-id "$COMPARTMENT_ID" \
@@ -170,24 +59,37 @@ jobs:
             --shape "VM.Standard.A1.Flex" \
             --shape-config '{"ocpus":2,"memoryInGBs":12}' \
             --subnet-id "$SUBNET_ID" \
-            --source-details file:///home/runner/source-details.json \
+            --image-id "$IMAGE_ID" \
             --ssh-authorized-keys-file "/home/runner/my_ssh_key.pub" \
             --assign-public-ip true \
-            --display-name "oracle-a1-singapore" 2>&1 || true)
+            --display-name "oci-free-arm-vm" \
+            --boot-volume-size-in-gbs 100 2>&1 || true)
 
-          echo "$OCI_OUTPUT"
+          echo "log_data<<EOF" >> $GITHUB_OUTPUT
+          echo "$OCI_OUTPUT" >> $GITHUB_OUTPUT
+          echo "EOF" >> $GITHUB_OUTPUT
 
           if echo "$OCI_OUTPUT" | grep -q '"lifecycle-state": "PROVISIONING"'; then
-            echo "SUCCESS: VM is being created. Disable this workflow after confirming the instance exists."
+            echo "Success: VM is provisioning."
             exit 0
-          elif echo "$OCI_OUTPUT" | grep -q 'Out of host capacity'; then
-            dispatch_next_run
-            exit 0
-          elif echo "$OCI_OUTPUT" | grep -Eqi 'RequestException|timed out|TooManyRequests|Too Many Requests|status": 429|status": 500'; then
-            echo "Transient OCI error detected; retrying later."
-            dispatch_next_run
-            exit 0
-          else
-            echo "Real error detected."
-            exit 1
           fi
+
+          echo "VM was not created."
+          exit 1
+
+      - name: Send Discord notification
+        if: always()
+        uses: sarisia/actions-status-discord@v1.15.4
+        with:
+          webhook: ${{ secrets.DISCORD_WEBHOOK_URL }}
+          title: "OCI VM Status: ${{ steps.create_vm.outcome }}"
+          status: ${{ steps.create_vm.outcome }}
+          color: ${{ steps.create_vm.outcome == 'success' && '0x28a745' || '0xdc3545' }}
+          description: |
+            Attempt to create A1.Flex VM.
+            Status: `${{ steps.create_vm.outcome }}`
+
+            Log Output:
+            ```json
+            ${{ steps.create_vm.outputs.log_data }}
+            ```
